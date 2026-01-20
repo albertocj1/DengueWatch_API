@@ -32,7 +32,7 @@ app = FastAPI(
 )
 
 origins = [
-    "https://dengue-watch-website.vercel.app/", 
+    "https://dengue-watch-website.vercel.app", 
     "http://127.0.0.1:5500",  # your Live Server address
     "http://localhost:5500",  # optional, in case Live Server uses localhost
     "http://localhost:8000",  # optional, for API testing
