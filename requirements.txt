@@ -6,4 +6,5 @@ tensorflow
 joblib
 uvicorn[standard]
 python-multipart
-scikit-learn
+pymongo
+bson
