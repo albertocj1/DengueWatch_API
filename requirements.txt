@@ -7,4 +7,3 @@ joblib
 uvicorn[standard]
 python-multipart
 pymongo
-bson
