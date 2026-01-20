@@ -7,3 +7,4 @@ joblib
 uvicorn[standard]
 python-multipart
 pymongo
+scikit-learn
