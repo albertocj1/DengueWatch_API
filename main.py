@@ -49,8 +49,8 @@ app.add_middleware(
 # =====================================================
 # 📦 MODEL & SCALER PATH
 # =====================================================
-MODEL_PATH = "backend/Model/dengue_classification_model.keras"
-SCALER_PATH = "backend/Model/scaler_classification.pkl"
+MODEL_PATH = "dengue_classification_model.keras"
+SCALER_PATH = "scaler_classification.pkl"
 
 # =====================================================
 # ⏱ WINDOW SIZE
