@@ -1,4 +1,4 @@
-from fastapi.encoders import jsonable_encoder
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, UploadFile, File
@@ -231,56 +231,61 @@ async def forecast_next_week(input_data: DengueForecastInput):
 @app.get("/api/cases-latest")
 async def get_latest_cases_per_city():
     """
-    Returns the most recent dengue cases per city
-    from the latest uploaded CSV.
+    Returns the latest number of cases per city from the latest uploaded CSV.
     """
     try:
-        # 1️⃣ Get latest uploaded CSV
-        doc = db["raw_csv_uploads"].find_one(
-            sort=[("uploaded_at", -1)]
-        )
-
-        if not doc:
+        # Get the latest CSV upload
+        csv_doc = db["raw_csv_uploads"].find_one(sort=[("uploaded_at", -1)])
+        if not csv_doc:
             return []
 
-        # 2️⃣ Load CSV into DataFrame
-        df = pd.read_csv(io.BytesIO(doc["data"]))
+        # Read CSV
+        csv_bytes = bytes(csv_doc["data"])
+        df = pd.read_csv(io.BytesIO(csv_bytes))
 
-        # 3️⃣ Create DATE column
-        df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]])
+        # Clean & normalize columns
+        df.columns = [c.strip().upper() for c in df.columns]
+        df["CITY"] = df["CITY"].str.strip().str.upper()
+        df["CASES"] = pd.to_numeric(df["CASES"], errors="coerce")
+        df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]], errors="coerce")
+        df = df.dropna(subset=["CITY", "CASES", "DATE"])
 
-        # 4️⃣ Get latest record per city
-        latest_df = (
-            df.sort_values("DATE")
-              .groupby("LAND AREA")
-              .tail(1)
-        )
+        # Take the latest row per city
+        latest_rows = df.sort_values("DATE").groupby("CITY", as_index=False).tail(1)
 
         results = []
-
-        for _, row in latest_df.iterrows():
-            city = land_area_to_city.get(
-                round(row["LAND AREA"], 2),
-                "Unknown City"
-            )
-
+        for _, row in latest_rows.iterrows():
             results.append({
-                "city": city.title(),
-                "cases": int(row["CASES"]),
-                "risk_level": "High" if row["CASES"] > 100 else "Moderate" if row["CASES"] > 50 else "Low",
-                "last_updated": row["DATE"].strftime("%b %d, %Y")
+                "city": row["CITY"],
+                "total_cases": int(row["CASES"]),
+                "last_updated": row["DATE"].strftime("%Y-%m-%d")
             })
-
-        # 5️⃣ Sort by cases (descending)
-        results.sort(key=lambda x: x["cases"], reverse=True)
 
         return results
 
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch latest cases: {e}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to fetch latest cases: {e}")
+
+@app.get("/api/risk-latest")
+async def get_latest_risk_per_city():
+    """
+    Returns the latest dengue risk per city from the forecasts collection.
+    """
+    try:
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {
+                "_id": "$city",
+                "city": {"$first": "$city"},
+                "risk_level": {"$first": "$risk_level"},
+                "forecast_week": {"$first": "$forecast_week"},
+                "created_at": {"$first": "$created_at"}
+            }},
+            {"$project": {"_id": 0}}
+        ]
+        return list(collection.aggregate(pipeline))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch latest risk: {e}")
 
 
 # =====================================================
@@ -358,37 +363,6 @@ async def get_raw_csv_data():
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-    
-from fastapi.encoders import jsonable_encoder
-
-@app.get("/api/alerts")
-async def get_alerts(city: str = None, risk_level: str = None):
-    """
-    Fetch all alerts (used by alerts.html page)
-    Supports filtering by city and risk level
-    """
-    query = {}
-
-    if city:
-        query["city"] = city.strip().upper()
-
-    if risk_level and risk_level.lower() != "all":
-        query["risk_level"] = risk_level.capitalize()
-
-    docs = alerts_collection.find(query).sort("created_at", -1)
-
-    results = []
-    for doc in docs:
-        results.append({
-            "city": doc["city"],
-            "risk_level": doc["risk_level"],
-            "risk_assessment": doc["risk_assessment"],
-            "actions": doc["actions"],
-            "updated_at": doc.get("created_at")
-        })
-
-    return jsonable_encoder(results)
-
 
 
 
@@ -477,26 +451,37 @@ async def save_alert(alert: AlertRequest):
 # =====================================================
 # CSV Preprocessing + Recursive Forecasting + Save CSV
 # =====================================================
-from fastapi import UploadFile, File, HTTPException
+from fastapi import UploadFile, File
 from bson import Binary
-import io
-import pandas as pd
-import datetime
 
 @app.post("/preprocessing")
-async def preprocessing(file: UploadFile = File(...)):
+async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
     """
     Accepts a raw CSV file containing multiple cities,
-    saves the CSV in MongoDB (both raw and JSON formats),
+    saves the CSV in MongoDB,
     preprocesses each city independently,
-    and returns forecast for the NEXT WEEK only.
+    and returns recursive forecasts for up to `weeks_ahead` weeks.
+    Default is 4 weeks, max is 8 weeks.
     """
     try:
+        # Cap weeks ahead at 8
+        weeks_ahead = min(weeks_ahead, 8)
+
         # -------------------------------
         # Read CSV
         # -------------------------------
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
+
+        # -------------------------------
+        # Save raw CSV in MongoDB
+        # -------------------------------
+        db["raw_csv_uploads"].insert_one({
+            "filename": file.filename,
+            "uploaded_at": datetime.datetime.utcnow(),
+            "cities": list(df["LAND AREA"].unique()),
+            "data": Binary(contents)
+        })
 
         # -------------------------------
         # Required columns (raw)
@@ -515,27 +500,6 @@ async def preprocessing(file: UploadFile = File(...)):
             )
 
         # -------------------------------
-        # Save original CSV in raw_csv_uploads
-        # -------------------------------
-        db["raw_csv_uploads"].insert_one({
-            "filename": file.filename,
-            "uploaded_at": datetime.datetime.utcnow(),
-            "cities": list(df["LAND AREA"].unique()),
-            "data": Binary(contents)
-        })
-
-        # -------------------------------
-        # Save CSV as JSON in raw_csv_json
-        # -------------------------------
-        csv_json = df.to_dict(orient="records")
-        db["raw_csv_json"].insert_one({
-            "filename": file.filename,
-            "uploaded_at": datetime.datetime.utcnow(),
-            "cities": list(df["LAND AREA"].unique()),
-            "data_json": csv_json
-        })
-
-        # -------------------------------
         # Sort by date globally
         # -------------------------------
         df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]])
@@ -549,69 +513,88 @@ async def preprocessing(file: UploadFile = File(...)):
         for land_area, city_df in df.groupby("LAND AREA"):
             city_df = city_df.sort_values("DATE").reset_index(drop=True)
 
-            # Normalize cases per 100k population
+            # Incidence per 100k
             city_df["CASES"] = (city_df["CASES"] / city_df["POPULATION"]) * 100000
 
+            # Forecast container for recursive steps
+            city_forecasts = []
+
+            # Copy for recursive predictions
             temp_df = city_df.copy()
 
-            # -------------------------------
-            # Lag features
-            # -------------------------------
-            for lag in range(1, WINDOW + 1):
-                temp_df[f"CASES_lag{lag}"] = temp_df["CASES"].shift(lag)
-                temp_df[f"RAINFALL_lag{lag}"] = temp_df["RAINFALL"].shift(lag)
-                temp_df[f"TMAX_lag{lag}"] = temp_df["TMAX"].shift(lag)
-                temp_df[f"TMIN_lag{lag}"] = temp_df["TMIN"].shift(lag)
-                temp_df[f"TMEAN_lag{lag}"] = temp_df["TMEAN"].shift(lag)
-                temp_df[f"RH_lag{lag}"] = temp_df["RH"].shift(lag)
-                temp_df[f"SUNSHINE_lag{lag}"] = temp_df["SUNSHINE"].shift(lag)
+            for week in range(1, weeks_ahead + 1):
+                # -------------------------------
+                # Lag features
+                # -------------------------------
+                for lag in range(1, WINDOW + 1):
+                    temp_df[f"CASES_lag{lag}"] = temp_df["CASES"].shift(lag)
+                    temp_df[f"RAINFALL_lag{lag}"] = temp_df["RAINFALL"].shift(lag)
+                    temp_df[f"TMAX_lag{lag}"] = temp_df["TMAX"].shift(lag)
+                    temp_df[f"TMIN_lag{lag}"] = temp_df["TMIN"].shift(lag)
+                    temp_df[f"TMEAN_lag{lag}"] = temp_df["TMEAN"].shift(lag)
+                    temp_df[f"RH_lag{lag}"] = temp_df["RH"].shift(lag)
+                    temp_df[f"SUNSHINE_lag{lag}"] = temp_df["SUNSHINE"].shift(lag)
 
-            # -------------------------------
-            # Rolling features
-            # -------------------------------
-            temp_df["CASES_roll2_mean"] = temp_df["CASES"].rolling(2).mean()
-            temp_df["CASES_roll4_mean"] = temp_df["CASES"].rolling(4).mean()
-            temp_df["CASES_roll2_sum"] = temp_df["CASES"].rolling(2).sum()
-            temp_df["CASES_roll4_sum"] = temp_df["CASES"].rolling(4).sum()
+                # -------------------------------
+                # Rolling features
+                # -------------------------------
+                temp_df["CASES_roll2_mean"] = temp_df["CASES"].rolling(2).mean()
+                temp_df["CASES_roll4_mean"] = temp_df["CASES"].rolling(4).mean()
+                temp_df["CASES_roll2_sum"] = temp_df["CASES"].rolling(2).sum()
+                temp_df["CASES_roll4_sum"] = temp_df["CASES"].rolling(4).sum()
 
-            temp_df["RAINFALL_roll2_mean"] = temp_df["RAINFALL"].rolling(2).mean()
-            temp_df["RAINFALL_roll4_mean"] = temp_df["RAINFALL"].rolling(4).mean()
-            temp_df["RAINFALL_roll2_sum"] = temp_df["RAINFALL"].rolling(2).sum()
-            temp_df["RAINFALL_roll4_sum"] = temp_df["RAINFALL"].rolling(4).sum()
+                temp_df["RAINFALL_roll2_mean"] = temp_df["RAINFALL"].rolling(2).mean()
+                temp_df["RAINFALL_roll4_mean"] = temp_df["RAINFALL"].rolling(4).mean()
+                temp_df["RAINFALL_roll2_sum"] = temp_df["RAINFALL"].rolling(2).sum()
+                temp_df["RAINFALL_roll4_sum"] = temp_df["RAINFALL"].rolling(4).sum()
 
-            temp_df["TMEAN_roll2_mean"] = temp_df["TMEAN"].rolling(2).mean()
-            temp_df["TMEAN_roll4_mean"] = temp_df["TMEAN"].rolling(4).mean()
-            temp_df["TMEAN_roll2_sum"] = temp_df["TMEAN"].rolling(2).sum()
-            temp_df["TMEAN_roll4_sum"] = temp_df["TMEAN"].rolling(4).sum()
+                temp_df["TMEAN_roll2_mean"] = temp_df["TMEAN"].rolling(2).mean()
+                temp_df["TMEAN_roll4_mean"] = temp_df["TMEAN"].rolling(4).mean()
+                temp_df["TMEAN_roll2_sum"] = temp_df["TMEAN"].rolling(2).sum()
+                temp_df["TMEAN_roll4_sum"] = temp_df["TMEAN"].rolling(4).sum()
 
-            temp_df["RH_roll2_mean"] = temp_df["RH"].rolling(2).mean()
-            temp_df["RH_roll4_mean"] = temp_df["RH"].rolling(4).mean()
-            temp_df["RH_roll2_sum"] = temp_df["RH"].rolling(2).sum()
-            temp_df["RH_roll4_sum"] = temp_df["RH"].rolling(4).sum()
+                temp_df["RH_roll2_mean"] = temp_df["RH"].rolling(2).mean()
+                temp_df["RH_roll4_mean"] = temp_df["RH"].rolling(4).mean()
+                temp_df["RH_roll2_sum"] = temp_df["RH"].rolling(2).sum()
+                temp_df["RH_roll4_sum"] = temp_df["RH"].rolling(4).sum()
 
-            # Drop NaNs
-            temp_df_clean = temp_df.dropna().reset_index(drop=True)
-            if len(temp_df_clean) < WINDOW:
-                continue
+                # Drop NaNs
+                temp_df_clean = temp_df.dropna().reset_index(drop=True)
+                if len(temp_df_clean) < WINDOW:
+                    break
 
-            # -------------------------------
-            # Predict NEXT WEEK only
-            # -------------------------------
-            window_df = temp_df_clean.iloc[-WINDOW:][final_feature_columns]
-            scaled = scaler.transform(window_df)
-            X = scaled.reshape(1, WINDOW, len(final_feature_columns))
-            preds = model.predict(X)
-            risk = risk_labels[int(np.argmax(preds[0]))]
+                # -------------------------------
+                # Extract last WINDOW and predict
+                # -------------------------------
+                window_df = temp_df_clean.iloc[-WINDOW:][final_feature_columns]
+                scaled = scaler.transform(window_df)
+                X = scaled.reshape(1, WINDOW, len(final_feature_columns))
+                preds = model.predict(X)
+                risk = risk_labels[int(np.argmax(preds[0]))]
+                city_name = land_area_to_city.get(round(land_area, 2), "Unknown City")
 
-            last_date = temp_df["DATE"].iloc[-1]
-            forecast_date = last_date + pd.Timedelta(days=7)
-            city_name = land_area_to_city.get(round(land_area, 2), "Unknown City")
+                if week == 1:
+                    save_forecast_to_db(city_name, risk)
 
-            results.append({
-                "city": city_name,
-                "forecast_date": forecast_date.strftime("%Y-%m-%d"),
-                "risk_level": risk
-            })
+
+                # Forecast date = last date + 7 days
+                last_date = temp_df["DATE"].iloc[-1]
+                forecast_date = last_date + pd.Timedelta(days=7)
+
+                city_forecasts.append({
+                    "city": city_name,
+                    "week": week,
+                    "forecast_date": forecast_date.strftime("%Y-%m-%d"),
+                    "risk_level": risk
+                })
+
+                # Append placeholder row for next week
+                new_row = temp_df.iloc[-1:].copy()
+                new_row["DATE"] = forecast_date
+                new_row["CASES"] = (100000 / new_row["POPULATION"].values[0]) * 0
+                temp_df = pd.concat([temp_df, new_row], ignore_index=True)
+
+            results.extend(city_forecasts)
 
         if not results:
             raise HTTPException(
@@ -622,6 +605,7 @@ async def preprocessing(file: UploadFile = File(...)):
         return {
             "status": "OK",
             "num_cities": len(set(r["city"] for r in results)),
+            "weeks_forecasted": weeks_ahead,
             "forecasts": results
         }
 
@@ -632,3 +616,112 @@ async def preprocessing(file: UploadFile = File(...)):
             status_code=500,
             detail=f"CSV preprocessing failed: {e}"
         )
+    
+@app.get("/api/alerts")
+async def get_weekly_alerts_from_latest_csv():
+    """
+    Generates weekly dengue alerts per city based on the latest uploaded CSV,
+    and enriches them with risk assessment & recommended actions
+    from alert_recommendations collection.
+    """
+    try:
+        # 1. Get latest CSV upload
+        csv_doc = db["raw_csv_uploads"].find_one(sort=[("uploaded_at", -1)])
+        if not csv_doc:
+            return []
+
+        # 2. Read CSV
+        csv_bytes = bytes(csv_doc["data"])
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+
+        # 3. Clean & normalize
+        df.columns = [c.strip().upper() for c in df.columns]
+        df["CITY"] = df["CITY"].str.strip().str.upper()
+        df["CASES"] = pd.to_numeric(df["CASES"], errors="coerce")
+
+        df["DATE"] = pd.to_datetime(
+            df[["YEAR", "MONTH", "DAY"]],
+            errors="coerce"
+        )
+
+        df = df.dropna(subset=["CITY", "CASES", "DATE"])
+
+        alerts = []
+
+        # --- Get latest risk per city from forecasts collection ---
+        pipeline = [
+            {"$sort": {"created_at": -1}},
+            {"$group": {
+                "_id": "$city",
+                "city": {"$first": "$city"},
+                "risk_level": {"$first": "$risk_level"},
+                "forecast_week": {"$first": "$forecast_week"},
+                "created_at": {"$first": "$created_at"}
+            }},
+            {"$project": {"_id": 0}}
+        ]
+
+        latest_risks = {
+            r["city"].upper(): r["risk_level"]
+            for r in db["forecasts"].aggregate(pipeline)
+        }
+
+        # 4. Per-city aggregation
+        for city, city_df in df.groupby("CITY"):
+
+            city_df = city_df.sort_values("DATE")
+            latest_row = city_df.iloc[-1]
+            latest_date = latest_row["DATE"]
+
+            current_start = latest_date - pd.Timedelta(days=6)
+            previous_start = current_start - pd.Timedelta(days=7)
+            previous_end = current_start - pd.Timedelta(days=1)
+
+            current_cases = city_df.loc[
+                (city_df["DATE"] >= current_start) &
+                (city_df["DATE"] <= latest_date),
+                "CASES"
+            ].sum()
+
+            previous_cases = city_df.loc[
+                (city_df["DATE"] >= previous_start) &
+                (city_df["DATE"] <= previous_end),
+                "CASES"
+            ].sum()
+
+            if previous_cases == 0:
+                percent_change = 100.0 if current_cases > 0 else 0.0
+            else:
+                percent_change = ((current_cases - previous_cases) / previous_cases) * 100
+
+            alert_level = latest_risks.get(city, "Low")
+
+            # 🔥 NEW: Fetch alert recommendations
+            alert_doc = alerts_collection.find_one(
+                {
+                    "city": city,
+                    "risk_level": alert_level
+                },
+                {"_id": 0}
+            )
+
+            alerts.append({
+                "city": city,
+                "current_week_cases": int(current_cases),
+                "previous_week_cases": int(previous_cases),
+                "percent_change": round(percent_change, 1),
+                "alert_level": alert_level,
+                "risk_assessment": alert_doc.get("risk_assessment", "No assessment available.")
+                    if alert_doc else "No assessment available.",
+                "actions": alert_doc.get("actions", []) if alert_doc else [],
+                "last_updated": latest_row["DATE"].strftime("%Y-%m-%d")
+            })
+
+        return alerts
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate alerts: {e}"
+        )
+
