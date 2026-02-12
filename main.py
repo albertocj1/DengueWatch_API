@@ -32,7 +32,7 @@ app = FastAPI(
 )
 
 origins = [
-    "https://dengue-watch-website.vercel.app", 
+    "https://dengue-watch-website.vercel.app",
     "http://127.0.0.1:5500",  # your Live Server address
     "http://localhost:5500",  # optional, in case Live Server uses localhost
     "http://localhost:8000",  # optional, for API testing
@@ -144,11 +144,12 @@ collection = db["forecasts"]
 alerts_collection = db["alert_recommendations"]
 
 
-def save_forecast_to_db(city: str, risk_level: str):
+def save_forecast_to_db(city: str, risk_level: str, forecast_date: str):
     doc = {
         "city": city,
         "risk_level": risk_level,
         "forecast_week": "Next Week",
+        "forecast_date": forecast_date,
         "created_at": datetime.datetime.utcnow()
     }
     collection.insert_one(doc)
@@ -500,10 +501,10 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
             )
 
         # -------------------------------
-        # Sort by date globally
+        # Prepare dataframe
         # -------------------------------
         df["DATE"] = pd.to_datetime(df[["YEAR", "MONTH", "DAY"]])
-        df = df.sort_values("DATE")
+        df = df.sort_values("DATE").reset_index(drop=True)
 
         results = []
 
@@ -512,14 +513,50 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
         # -------------------------------
         for land_area, city_df in df.groupby("LAND AREA"):
             city_df = city_df.sort_values("DATE").reset_index(drop=True)
+            city_name = land_area_to_city.get(round(land_area, 2), "Unknown City")
 
             # Incidence per 100k
             city_df["CASES"] = (city_df["CASES"] / city_df["POPULATION"]) * 100000
 
-            # Forecast container for recursive steps
-            city_forecasts = []
+            # -------------------------------
+            # Determine last forecast date for city
+            # -------------------------------
+            last_record = db["forecasts"].find_one(
+                {"city": city_name},
+                sort=[("forecast_date", -1)]
+            )
+            if last_record:
+                last_forecast_date = pd.to_datetime(last_record["forecast_date"])
+            else:
+                # First ever upload: start date = Jan 12, 2020
+                last_forecast_date = pd.Timestamp(year=2020, month=1, day=11)
 
-            # Copy for recursive predictions
+            expected_first_date = last_forecast_date
+            csv_first_date = city_df["DATE"].min()
+
+            # -------------------------------
+            # Handle gaps or misaligned uploads
+            # -------------------------------
+            if csv_first_date > expected_first_date:
+                # Fill missing dates with zero-case placeholders
+                missing_dates = pd.date_range(
+                    start=expected_first_date,
+                    end=csv_first_date - pd.Timedelta(days=1)
+                )
+                placeholder_rows = []
+                for dt in missing_dates:
+                    placeholder = city_df.iloc[0].copy()
+                    placeholder["DATE"] = dt
+                    placeholder["CASES"] = 0
+                    placeholder_rows.append(placeholder)
+                if placeholder_rows:
+                    city_df = pd.concat([pd.DataFrame(placeholder_rows), city_df], ignore_index=True)
+            
+
+            # -------------------------------
+            # Forecast container for recursive steps
+            # -------------------------------
+            city_forecasts = []
             temp_df = city_df.copy()
 
             for week in range(1, weeks_ahead + 1):
@@ -538,25 +575,11 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
                 # -------------------------------
                 # Rolling features
                 # -------------------------------
-                temp_df["CASES_roll2_mean"] = temp_df["CASES"].rolling(2).mean()
-                temp_df["CASES_roll4_mean"] = temp_df["CASES"].rolling(4).mean()
-                temp_df["CASES_roll2_sum"] = temp_df["CASES"].rolling(2).sum()
-                temp_df["CASES_roll4_sum"] = temp_df["CASES"].rolling(4).sum()
-
-                temp_df["RAINFALL_roll2_mean"] = temp_df["RAINFALL"].rolling(2).mean()
-                temp_df["RAINFALL_roll4_mean"] = temp_df["RAINFALL"].rolling(4).mean()
-                temp_df["RAINFALL_roll2_sum"] = temp_df["RAINFALL"].rolling(2).sum()
-                temp_df["RAINFALL_roll4_sum"] = temp_df["RAINFALL"].rolling(4).sum()
-
-                temp_df["TMEAN_roll2_mean"] = temp_df["TMEAN"].rolling(2).mean()
-                temp_df["TMEAN_roll4_mean"] = temp_df["TMEAN"].rolling(4).mean()
-                temp_df["TMEAN_roll2_sum"] = temp_df["TMEAN"].rolling(2).sum()
-                temp_df["TMEAN_roll4_sum"] = temp_df["TMEAN"].rolling(4).sum()
-
-                temp_df["RH_roll2_mean"] = temp_df["RH"].rolling(2).mean()
-                temp_df["RH_roll4_mean"] = temp_df["RH"].rolling(4).mean()
-                temp_df["RH_roll2_sum"] = temp_df["RH"].rolling(2).sum()
-                temp_df["RH_roll4_sum"] = temp_df["RH"].rolling(4).sum()
+                for col in ["CASES", "RAINFALL", "TMEAN", "RH"]:
+                    temp_df[f"{col}_roll2_mean"] = temp_df[col].rolling(2).mean()
+                    temp_df[f"{col}_roll4_mean"] = temp_df[col].rolling(4).mean()
+                    temp_df[f"{col}_roll2_sum"] = temp_df[col].rolling(2).sum()
+                    temp_df[f"{col}_roll4_sum"] = temp_df[col].rolling(4).sum()
 
                 # Drop NaNs
                 temp_df_clean = temp_df.dropna().reset_index(drop=True)
@@ -571,15 +594,13 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
                 X = scaled.reshape(1, WINDOW, len(final_feature_columns))
                 preds = model.predict(X)
                 risk = risk_labels[int(np.argmax(preds[0]))]
-                city_name = land_area_to_city.get(round(land_area, 2), "Unknown City")
-
-                if week == 1:
-                    save_forecast_to_db(city_name, risk)
-
 
                 # Forecast date = last date + 7 days
                 last_date = temp_df["DATE"].iloc[-1]
                 forecast_date = last_date + pd.Timedelta(days=7)
+
+                if week == 1:
+                    save_forecast_to_db(city_name, risk, forecast_date.strftime("%Y-%m-%d"))
 
                 city_forecasts.append({
                     "city": city_name,
@@ -591,7 +612,7 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
                 # Append placeholder row for next week
                 new_row = temp_df.iloc[-1:].copy()
                 new_row["DATE"] = forecast_date
-                new_row["CASES"] = (100000 / new_row["POPULATION"].values[0]) * 0
+                new_row["CASES"] = 0
                 temp_df = pd.concat([temp_df, new_row], ignore_index=True)
 
             results.extend(city_forecasts)
@@ -621,8 +642,7 @@ async def preprocessing(file: UploadFile = File(...), weeks_ahead: int = 4):
 async def get_weekly_alerts_from_latest_csv():
     """
     Generates weekly dengue alerts per city based on the latest uploaded CSV,
-    and enriches them with risk assessment & recommended actions
-    from alert_recommendations collection.
+    but uses the latest risk per city from forecasts instead of percent_change.
     """
     try:
         # 1. Get latest CSV upload
@@ -660,19 +680,17 @@ async def get_weekly_alerts_from_latest_csv():
             }},
             {"$project": {"_id": 0}}
         ]
-
-        latest_risks = {
-            r["city"].upper(): r["risk_level"]
-            for r in db["forecasts"].aggregate(pipeline)
-        }
+        latest_risks = {r["city"].upper(): r["risk_level"] for r in db["forecasts"].aggregate(pipeline)}
 
         # 4. Per-city aggregation
         for city, city_df in df.groupby("CITY"):
 
+            # Sort city data by date (latest last)
             city_df = city_df.sort_values("DATE")
             latest_row = city_df.iloc[-1]
             latest_date = latest_row["DATE"]
 
+            # Define week windows relative to this city's latest date
             current_start = latest_date - pd.Timedelta(days=6)
             previous_start = current_start - pd.Timedelta(days=7)
             previous_end = current_start - pd.Timedelta(days=1)
@@ -689,31 +707,21 @@ async def get_weekly_alerts_from_latest_csv():
                 "CASES"
             ].sum()
 
+            # Percent change (still keep for info, but won't use it for alert_level)
             if previous_cases == 0:
                 percent_change = 100.0 if current_cases > 0 else 0.0
             else:
                 percent_change = ((current_cases - previous_cases) / previous_cases) * 100
 
-            alert_level = latest_risks.get(city, "Low")
-
-            # 🔥 NEW: Fetch alert recommendations
-            alert_doc = alerts_collection.find_one(
-                {
-                    "city": city,
-                    "risk_level": alert_level
-                },
-                {"_id": 0}
-            )
+            # Use risk_level from forecasts instead of percent_change
+            alert_level = latest_risks.get(city, "LOW")  # default LOW if missing
 
             alerts.append({
                 "city": city,
                 "current_week_cases": int(current_cases),
                 "previous_week_cases": int(previous_cases),
-                "percent_change": round(percent_change, 1),
+                "percent_change": round(percent_change, 1),  # still return for info
                 "alert_level": alert_level,
-                "risk_assessment": alert_doc.get("risk_assessment", "No assessment available.")
-                    if alert_doc else "No assessment available.",
-                "actions": alert_doc.get("actions", []) if alert_doc else [],
                 "last_updated": latest_row["DATE"].strftime("%Y-%m-%d")
             })
 
@@ -724,4 +732,3 @@ async def get_weekly_alerts_from_latest_csv():
             status_code=500,
             detail=f"Failed to generate alerts: {e}"
         )
-
